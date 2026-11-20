@@ -51,6 +51,8 @@ def parse_problem_html(html_content):
         div = div[0]
         # Get all children as HTML
         children = div.getchildren()
+        if not children:
+            return (div.text or '').strip()
         html_parts = []
         for child in children:
             # For input/output, skip the first section-title div if requested
@@ -104,6 +106,14 @@ def index(request):
     """
     logger.info('Entered index view with method=%s', request.method)
     context = {}
+    storage_provider = getattr(settings, "STORAGE_PROVIDER", "azure")
+    context["storage_provider"] = storage_provider
+    if storage_provider == "gdrive":
+        context["storage_button_label"] = "Migrate Test Cases to Google Drive"
+        context["storage_loading_text"] = "Migrating test cases to Google Drive..."
+    else:
+        context["storage_button_label"] = "Migrate Test Cases to Azure"
+        context["storage_loading_text"] = "Migrating to Azure..."
     
     # Get all existing tags for the dropdown
     all_tags = ProblemTag.objects.all().order_by('tag_name')
@@ -195,55 +205,63 @@ def index(request):
                             context['error'] = f"Problem with Polygon ID {polygon_id} has not been migrated to the database yet. Please migrate the problem to the database first before migrating test cases to Azure."
                             return render(request, 'problems/index.html', context)
                         
-                        # Problem exists in database, proceed with Azure migration
-                        logger.info('Problem found in DB, proceeding with Azure migration')
-                        AZURE_STORAGE_ACCOUNT_URL = settings.AZURE_STORAGE_ACCOUNT_URL
-                        AZURE_TENANT_ID = settings.AZURE_TENANT_ID
-                        AZURE_CLIENT_ID = settings.AZURE_CLIENT_ID
-                        AZURE_USERNAME = settings.AZURE_USERNAME
-                        AZURE_PASSWORD = settings.AZURE_PASSWORD
-                        AZURE_CONTAINER_NAME = settings.AZURE_CONTAINER_NAME
-                        
-                        # Use the database problem ID for Azure blob naming
-                        problem_id = problem_obj.id if problem_obj else None
-                        logger.info('Azure migration params: problem_id=%s, container=%s', problem_id, AZURE_CONTAINER_NAME)
-                        
-                        # Remove Redis cache for this problem id before Azure migration
-                        if problem_obj:
-                            api.delete_problem_test_case_cache(problem_id)
-                        
-                        # Check for custom checker before migration
-                        custom_checker_info = api.get_custom_checker_info(polygon_id)
-                        if custom_checker_info:
-                            logger.info('Custom checker detected before Azure migration: %s', custom_checker_info)
-                            context['info'] = f"Custom checker '{custom_checker_info['name']}' detected. Will be compiled and uploaded to Azure."
-                        
-                        logger.info('Calling migrate_to_azure_blob')
-                        try:
-                            api.migrate_to_azure_blob(
-                                polygon_id,
-                                AZURE_STORAGE_ACCOUNT_URL,
-                                AZURE_TENANT_ID,
-                                AZURE_CLIENT_ID,
-                                AZURE_USERNAME,
-                                AZURE_PASSWORD,
-                                AZURE_CONTAINER_NAME,
-                                problem_id
+                        logger.info('Problem found in DB, proceeding with storage migration')
+                        problem_id = problem_obj.id
+                        api.delete_problem_test_case_cache(problem_id)
+
+                        if settings.STORAGE_PROVIDER == "gdrive":
+                            from problems.storage import upload_problem_tests
+                            logger.info('Uploading test cases to Google Drive for problem_id=%s', problem_id)
+                            try:
+                                uploaded_count, folder_url = upload_problem_tests(
+                                    api, polygon_id, problem_id
+                                )
+                            except Exception as e:
+                                logger.error('Google Drive migration failed: %s', e, exc_info=True)
+                                context['error'] = f"Google Drive migration failed: {str(e)}"
+                                raise
+                            context['success'] = (
+                                f"Test cases migrated to Google Drive successfully ({uploaded_count} test cases). "
+                                f"Folder: {folder_url}"
                             )
-                            azure_blob_uploaded = True
-                            azure_blob_problem_id = problem_id
-                        except Exception as e:
-                            logger.error('Azure migration failed: %s', e, exc_info=True)
-                            # Compensate: attempt to delete any uploaded blobs if possible (pseudo-code, implement as needed)
-                            # api.delete_azure_blob(problem_id)
-                            context['error'] = f"Azure migration failed: {str(e)}"
-                            raise
-                        logger.info('Azure migration completed successfully')
-                        
-                        success_message = "Test cases migrated to Azure Blob Storage successfully."
-                        if custom_checker_info:
-                            success_message += f" Custom checker '{custom_checker_info['name']}' was also compiled and uploaded."
-                        context['success'] = success_message
+                        else:
+                            AZURE_STORAGE_ACCOUNT_URL = settings.AZURE_STORAGE_ACCOUNT_URL
+                            AZURE_TENANT_ID = settings.AZURE_TENANT_ID
+                            AZURE_CLIENT_ID = settings.AZURE_CLIENT_ID
+                            AZURE_USERNAME = settings.AZURE_USERNAME
+                            AZURE_PASSWORD = settings.AZURE_PASSWORD
+                            AZURE_CONTAINER_NAME = settings.AZURE_CONTAINER_NAME
+                            logger.info('Azure migration params: problem_id=%s, container=%s', problem_id, AZURE_CONTAINER_NAME)
+
+                            custom_checker_info = api.get_custom_checker_info(polygon_id)
+                            if custom_checker_info:
+                                logger.info('Custom checker detected before Azure migration: %s', custom_checker_info)
+                                context['info'] = f"Custom checker '{custom_checker_info['name']}' detected. Will be compiled and uploaded to Azure."
+
+                            logger.info('Calling migrate_to_azure_blob')
+                            try:
+                                api.migrate_to_azure_blob(
+                                    polygon_id,
+                                    AZURE_STORAGE_ACCOUNT_URL,
+                                    AZURE_TENANT_ID,
+                                    AZURE_CLIENT_ID,
+                                    AZURE_USERNAME,
+                                    AZURE_PASSWORD,
+                                    AZURE_CONTAINER_NAME,
+                                    problem_id
+                                )
+                                azure_blob_uploaded = True
+                                azure_blob_problem_id = problem_id
+                            except Exception as e:
+                                logger.error('Azure migration failed: %s', e, exc_info=True)
+                                context['error'] = f"Azure migration failed: {str(e)}"
+                                raise
+                            logger.info('Azure migration completed successfully')
+
+                            success_message = "Test cases migrated to Azure Blob Storage successfully."
+                            if custom_checker_info:
+                                success_message += f" Custom checker '{custom_checker_info['name']}' was also compiled and uploaded."
+                            context['success'] = success_message
                     
                     # Always fetch problem data for display
                     info = api.get_problem_info(polygon_id)

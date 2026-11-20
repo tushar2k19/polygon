@@ -5,6 +5,7 @@ import string
 import requests
 from urllib.parse import urlencode
 from django.conf import settings
+import html
 import json
 import os
 import sys
@@ -210,7 +211,8 @@ class PolygonAPI:
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(extract_dir)
             
-            # Find problem.html in the extracted files
+            # Older packages include problem.html. Current Polygon packages put the
+            # statement in statements/<language>/problem-properties.json instead.
             problem_html_path = None
             for root, dirs, files in os.walk(extract_dir):
                 for file in files:
@@ -220,14 +222,24 @@ class PolygonAPI:
                 if problem_html_path:
                     break
             
-            if not problem_html_path:
+            if problem_html_path:
+                with open(problem_html_path, 'r', encoding='utf-8') as f:
+                    problem_html_content = f.read()
+                logger.info("Successfully read problem.html content, length: %d characters", len(problem_html_content))
+                return problem_html_content
+
+            properties_path = self._find_statement_properties(extract_dir)
+            if not properties_path:
                 raise Exception("problem.html not found in the extracted package")
-            
-            # Read the problem.html content before cleanup
-            with open(problem_html_path, 'r', encoding='utf-8') as f:
-                problem_html_content = f.read()
-            
-            logger.info("Successfully read problem.html content, length: %d characters", len(problem_html_content))
+
+            with open(properties_path, 'r', encoding='utf-8') as f:
+                properties = json.load(f)
+            problem_html_content = self._statement_properties_to_html(properties)
+            logger.info(
+                "Built statement HTML from %s, length: %d characters",
+                properties_path,
+                len(problem_html_content),
+            )
             return problem_html_content
             
         except Exception as e:
@@ -239,6 +251,32 @@ class PolygonAPI:
                 logger.debug("Cleaned up temporary directory: %s", temp_dir)
             except Exception as cleanup_error:
                 logger.warning("Failed to clean up temporary directory %s: %s", temp_dir, cleanup_error)
+
+    def _find_statement_properties(self, extract_dir):
+        """Return the English statement properties file, or the first one found."""
+        candidates = []
+        for root, dirs, files in os.walk(extract_dir):
+            if "problem-properties.json" in files:
+                candidates.append(os.path.join(root, "problem-properties.json"))
+        for path in candidates:
+            if f"{os.sep}english{os.sep}" in path:
+                return path
+        return candidates[0] if candidates else None
+
+    def _statement_properties_to_html(self, properties):
+        """Build the HTML shape parse_problem_html already understands."""
+        def section(class_name, text):
+            return f'<div class="{class_name}">{html.escape(text or "")}</div>'
+
+        parts = [section("title", properties.get("name"))]
+        parts.append(section("legend", properties.get("legend")))
+        if properties.get("input"):
+            parts.append(section("input-specification", properties.get("input")))
+        if properties.get("output"):
+            parts.append(section("output-specification", properties.get("output")))
+        if properties.get("notes"):
+            parts.append(section("note", properties.get("notes")))
+        return "<html><body>" + "".join(parts) + "</body></html>"
 
     def get_problem_info(self, problem_id):
         """
